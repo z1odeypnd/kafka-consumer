@@ -1,0 +1,230 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import io
+import json
+import logging
+import os.path
+import sys
+import xml.dom.minidom
+
+import fastavro
+import kafka
+
+logging.getLogger(__name__).addHandler(logging.NullHandler())
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="This tool helps to read data from Kafka topics and outputs it to standard output")
+    parser.add_argument("--bootstrap-server", help="The server(s) to connect to (default: %(default)s)",
+                        dest="bootstrap_servers", default="localhost:9092", metavar="HOST:PORT", required=True)
+    parser.add_argument("--group", help="The consumer group id of the consumer (default: %(default)s)", dest="group",
+                        default=None)
+    parser.add_argument("--offset",
+                        help="The offset id to consume from (a non-negative number), or 'earliest' which means from "
+                             "beginning, or 'latest' which means from end (default: %(default)s)",
+                        dest="offset", default=0)
+    parser.add_argument("--partition", help="The partition to consume from (default: %(default)s)", dest="partition",
+                        type=int, default=None)
+    parser.add_argument("--max-messages",
+                        help="The maximum number of messages to consume before exiting. If not set, consumption is "
+                             "continual (default: %(default)s)",
+                        dest="max_messages", type=int, default=None)
+    group = parser.add_mutually_exclusive_group(required=True)
+    group.add_argument("--topic", help="The topic id to consume on", dest="topic")
+    group.add_argument("--list", help="List all available topics", dest="list", action="store_true")
+    parser.add_argument("--value-deserializer",
+                        help="Value deserializer. None (raw), JSON, XML, Avro (default: %(default)s)",
+                        dest="value_deserializer", choices=["None", "string", "JSON", "XML", "Avro"], type=str,
+                        default=None)
+    parser.add_argument("--avro-schema", help="file or folder contains avro schema. Mandatory with value-deserializer "
+                                              "= Avro",
+                        dest="avro_schema", type=str, default=None)
+    parser.add_argument("--no-timestamps", help="Don't print timestamps, topic, partition. Only message.",
+                        dest="no_timestamps", action="store_true")
+    parser.add_argument("--verbose", "-v", help="Verbose level", dest="log_level", action="count", default=0)
+    return parser.parse_args()
+
+
+class Consumer(kafka.KafkaConsumer):
+    def __init__(self, **kwargs):
+        super().__init__()
+        self._args = kwargs['args']
+        self._avro_path = None
+        self._avro_schema = None
+        if 'consumer_timeout_ms' in kwargs.keys():
+            if int(kwargs['consumer_timeout_ms']) >= 0:
+                self.config['consumer_timeout_ms'] = int(kwargs['consumer_timeout_ms'])
+
+    def _args_check(self):
+        if self._args.value_deserializer == "Avro":
+            if self._args.avro_schema is None:
+                logging.error("When value-deserializer is 'Avro', than Avro-schema is mandatory.")
+                return False
+            if os.path.exists(self._args.avro_schema):
+                self._avro_path = os.path.abspath(self._args.avro_schema)
+            else:
+                logging.error("Path '{}' to avro schema is not exists.".format(self._args.avro_schema))
+                return False
+        return True
+
+    def _list_topics(self):
+        for topic in sorted(self.topics()):
+            print("{}".format(topic))
+        return 0
+
+    def _parse_error(self, msg):
+        logging.error("{deserializer} parse error! "
+                      "Kafka message in '{topic}:{partition}:{offset}' "
+                      "is not {deserializer}. "
+                      "View debug for details (use -vvv).".format(deserializer=self._args.value_deserializer,
+                                                                  topic=msg.topic, partition=msg.partition,
+                                                                  offset=msg.offset))
+        msg_timestamp = datetime.datetime.fromtimestamp(msg.timestamp / 1000).isoformat()
+        logging.debug("RAW message: timestamp_iso={timestamp}, topic={topic}, partition={partition}, "
+                      "offset={offset}, value={message}".format(timestamp=msg_timestamp, topic=msg.topic,
+                                                                partition=msg.partition, offset=msg.offset,
+                                                                message=msg.value))
+
+    def _init_avro(self):
+        if os.path.isdir(self._avro_path):
+            for avro_schema in os.listdir(self._avro_path):
+                try:
+                    schema_path = os.path.abspath(os.path.join(self._avro_path, avro_schema))
+                    self._avro_schema = fastavro.schema.load_schema(schema_path)
+                    return True
+                except fastavro.schema.UnknownType:
+                    continue
+        else:
+            try:
+                self._avro_schema = fastavro.schema.load_schema(self._avro_path)
+                return True
+            except fastavro.schema.UnknownType as ex:
+                logging.error("Parse error: Unknown type '{type_name}'. "
+                              "Please, specify schema contains parent type: '{type_name}' "
+                              "or try to specify directory with schemas.".format(type_name=ex.name))
+                return False
+        print("Schema: {}".format(self._avro_schema))
+        return False
+
+    def _avro_deserialize(self, msg):
+        bytes_writer = io.BytesIO()
+        bytes_writer.write(msg)
+        bytes_writer.seek(0)
+
+        message = fastavro.schemaless_reader(bytes_writer, self._avro_schema)
+        return message
+
+    def _format_message(self, msg):
+        msg_text = msg.value
+        msg_string = msg.value.decode('utf8', 'ignore')
+        if self._args.value_deserializer == "string":
+            msg_text = msg_string
+
+        if self._args.value_deserializer == "JSON":
+            msg_text = json.dumps(msg_string)
+
+        if self._args.value_deserializer == "XML":
+            try:
+                msg_text = xml.dom.minidom.parseString(msg_string).toprettyxml()
+            except xml.parsers.expat.ExpatError:
+                self._parse_error(msg)
+                return None
+
+        if self._args.value_deserializer == "Avro":
+            try:
+                msg_text = self._avro_deserialize(msg_text)
+            except Exception as ex:
+                self._parse_error(msg)
+                return None
+
+        if self._args.no_timestamps:
+            return msg_text
+
+        msg_timestamp = datetime.datetime.fromtimestamp(msg.timestamp / 1000).isoformat()
+        return "{} [{}:{}:{}]: {}".format(msg_timestamp, msg.topic, msg.partition,
+                                          msg.offset, msg_text)
+
+    def _assign_topic_partitions(self):
+        self.partitions_list = []
+
+        if self._args.partition is not None:
+            if self._args.partition not in self.partitions_for_topic(self._args.topic):
+                logging.error("Topic: '{}' doesn't have partition number '{}'. "
+                              "Topic partitions: '{}'".format(self._args.topic, self._args.partition,
+                                                              self.partitions_for_topic(self._args.topic)))
+                return False
+        for partition in self.partitions_for_topic(self._args.topic):
+            if self._args.partition is not None:
+                if self._args.partition != partition:
+                    print("{} != {}".format(self._args.partition, partition))
+                    continue
+            self.partitions_list.append(kafka.TopicPartition(self._args.topic, partition))
+        self.assign(self.partitions_list)
+        return True
+
+    def _seek_to_offset(self):
+        if self._args.offset:
+            for partition in self.partitions_list:
+                self.seek(partition, self._args.offset)
+        else:
+            self.seek_to_beginning()
+
+    def _read_consumer(self):
+        if self._args.topic not in self.topics():
+            logging.error("Topic '{}' does not exists on Kafka '{}'".format(self._args.topic,
+                                                                            self._args.bootstrap_servers))
+            return 1
+
+        if not self._assign_topic_partitions():
+            return 1
+        self._seek_to_offset()
+        messages_count = 0
+        try:
+            for message in self:
+                formatted_message = self._format_message(message)
+                if formatted_message is not None:
+                    print(formatted_message)
+                messages_count += 1
+                if self._args.max_messages is not None:
+                    if self._args.max_messages == messages_count:
+                        return 0
+        finally:
+            print("\nMessages processed: {}".format(messages_count))
+            return 0
+
+    def run(self):
+        if self._args.list:
+            return self._list_topics()
+
+        if not self._args_check():
+            return 1
+
+        if self._args.value_deserializer == "Avro":
+            if not self._init_avro():
+                return 1
+        return self._read_consumer()
+
+
+def main():
+    log_format = "[%(asctime)s][%(levelname)-8s] [%(funcName)s.%(lineno)d]: %(message)s"
+    args = parse_args()
+    log_level = 40 - (10 * args.log_level) if args.log_level > 0 else 40
+    logging.basicConfig(format=log_format, level=log_level, stream=sys.stderr)
+
+    args.bootstrap_servers = args.bootstrap_servers.split(",")
+
+    logging.debug("Connect to Kafka '{}'".format(args.bootstrap_servers))
+    consumer = Consumer(bootstrap_servers=args.bootstrap_servers, args=args, consumer_timeout_ms=1000)
+
+    try:
+        return consumer.run()
+    except KeyboardInterrupt:
+        consumer.close()
+        print("\nInterrupted")
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
