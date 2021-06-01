@@ -49,8 +49,8 @@ def parse_args():
 
 class Consumer(kafka.KafkaConsumer):
     def __init__(self, **kwargs):
-        super().__init__()
         self._args = kwargs['args']
+        super().__init__(bootstrap_servers=self._args.bootstrap_servers)
         self._avro_path = None
         self._avro_schema = None
         if 'consumer_timeout_ms' in kwargs.keys():
@@ -87,15 +87,40 @@ class Consumer(kafka.KafkaConsumer):
                                                                 partition=msg.partition, offset=msg.offset,
                                                                 message=msg.value))
 
+    def _load_schema_recursively(self, schemas_list, child_schema_file=None, ordered_schema=None):
+        def _load_schema(schema_file):
+            schema_path = os.path.abspath(os.path.join(self._avro_path, schema_file))
+            with open(schema_path, 'r') as sf:
+                schema_json = json.load(sf)
+            try:
+                ordered_schema.append(fastavro.schema.parse_schema(schema_json))
+                schemas_list.remove(schema_file)
+            except fastavro.schema.UnknownType as e:
+                child_schema_file = str(e.name)
+                ordered_schema.append(self._load_schema_recursively(schemas_list,
+                                                                    child_schema_file=child_schema_file,
+                                                                    ordered_schema=ordered_schema))
+            return ordered_schema
+
+        if ordered_schema is None:
+            ordered_schema = []
+        while len(schemas_list) > 0:
+            if child_schema_file is not None:
+                ordered_schema = _load_schema(child_schema_file)
+            else:
+                for schema_file in schemas_list:
+                    ordered_schema = _load_schema(schema_file)
+
+        return ordered_schema
+
+
     def _init_avro(self):
         if os.path.isdir(self._avro_path):
-            for avro_schema in os.listdir(self._avro_path):
-                try:
-                    schema_path = os.path.abspath(os.path.join(self._avro_path, avro_schema))
-                    self._avro_schema = fastavro.schema.load_schema(schema_path)
-                    return True
-                except fastavro.schema.UnknownType:
-                    continue
+            schemas_list = os.listdir(self._avro_path)
+            ordered_schemas = self._load_schema_recursively(schemas_list)
+            self._avro_schema = fastavro.schema.load_schema_ordered(ordered_schemas)
+            print("SCHEMAS: {}".format(self._avro_schema))
+            return True
         else:
             try:
                 self._avro_schema = fastavro.schema.load_schema(self._avro_path)
@@ -105,8 +130,6 @@ class Consumer(kafka.KafkaConsumer):
                               "Please, specify schema contains parent type: '{type_name}' "
                               "or try to specify directory with schemas.".format(type_name=ex.name))
                 return False
-        print("Schema: {}".format(self._avro_schema))
-        return False
 
     def _avro_deserialize(self, msg):
         bytes_writer = io.BytesIO()
@@ -216,7 +239,7 @@ def main():
     args.bootstrap_servers = args.bootstrap_servers.split(",")
 
     logging.debug("Connect to Kafka '{}'".format(args.bootstrap_servers))
-    consumer = Consumer(bootstrap_servers=args.bootstrap_servers, args=args, consumer_timeout_ms=1000)
+    consumer = Consumer(args=args, consumer_timeout_ms=1000)
 
     try:
         return consumer.run()
