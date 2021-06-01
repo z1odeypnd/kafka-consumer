@@ -87,39 +87,27 @@ class Consumer(kafka.KafkaConsumer):
                                                                 partition=msg.partition, offset=msg.offset,
                                                                 message=msg.value))
 
-    def _load_schema_recursively(self, schemas_list, child_schema_file=None, ordered_schema=None):
-        def _load_schema(schema_file):
-            schema_path = os.path.abspath(os.path.join(self._avro_path, schema_file))
-            with open(schema_path, 'r') as sf:
-                schema_json = json.load(sf)
-            try:
-                ordered_schema.append(fastavro.schema.parse_schema(schema_json))
-                schemas_list.remove(schema_file)
-            except fastavro.schema.UnknownType as e:
-                child_schema_file = str(e.name)
-                ordered_schema.append(self._load_schema_recursively(schemas_list,
-                                                                    child_schema_file=child_schema_file,
-                                                                    ordered_schema=ordered_schema))
-            return ordered_schema
-
-        if ordered_schema is None:
-            ordered_schema = []
+    def _load_schema_recursively(self, schemas_list, parent_schema=None):
+        named_schemas = {}
         while len(schemas_list) > 0:
-            if child_schema_file is not None:
-                ordered_schema = _load_schema(child_schema_file)
-            else:
-                for schema_file in schemas_list:
-                    ordered_schema = _load_schema(schema_file)
-
-        return ordered_schema
-
+            for schema_file in schemas_list:
+                schema_path = os.path.abspath(os.path.join(self._avro_path, schema_file))
+                logging.debug("Load schema from '{}'".format(schema_path))
+                with open(schema_path, 'r') as sf:
+                    schema = json.load(sf)
+                try:
+                    parent_schema = fastavro.schema.parse_schema(schema, named_schemas)
+                    logging.debug("'{}' parsed.".format(schema_path))
+                    schemas_list.remove(schema_file)
+                except fastavro.schema.UnknownType as e:
+                    logging.debug("UnknownType '{}'".format(e.name))
+        return parent_schema
 
     def _init_avro(self):
         if os.path.isdir(self._avro_path):
             schemas_list = os.listdir(self._avro_path)
-            ordered_schemas = self._load_schema_recursively(schemas_list)
-            self._avro_schema = fastavro.schema.load_schema_ordered(ordered_schemas)
-            print("SCHEMAS: {}".format(self._avro_schema))
+            result_schema = self._load_schema_recursively(schemas_list)
+            self._avro_schema = fastavro.schema.parse_schema(result_schema)
             return True
         else:
             try:
@@ -158,7 +146,7 @@ class Consumer(kafka.KafkaConsumer):
         if self._args.value_deserializer == "Avro":
             try:
                 msg_text = self._avro_deserialize(msg_text)
-            except Exception as ex:
+            except Exception:
                 self._parse_error(msg)
                 return None
 
